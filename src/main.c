@@ -1,11 +1,15 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
-
-#pragma comment(lib, "Psapi.lib")
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "etw_monitor.h"
+
+#ifdef _MSC_VER
+#pragma comment(lib, "Psapi.lib")
+#endif
+
 
 static void print_help(void)
 {
@@ -17,20 +21,41 @@ static void print_help(void)
     printf("  dll-watch.exe -modules <PID>\n");
     printf("  dll-watch.exe -modules-name <PROCESS_NAME>\n");
     printf("  dll-watch.exe -name <PROCESS_NAME>\n");
+    printf("  dll-watch.exe -monitor-pid <PID>\n");
+    printf("  dll-watch.exe -monitor-name <PROCESS_NAME>\n");
 }
 
 static int name_equal(const char *a, const char *b)
 {
-    size_t len_a = strlen(a);
-    size_t len_b = strlen(b);
+    const char *name_a = a;
+    const char *name_b = b;
+    const char *separator;
+    size_t len_a;
+    size_t len_b;
 
-    if (len_a >= 4 && _stricmp(a + len_a - 4, ".exe") == 0)
+    separator = strrchr(name_a, '\\');
+    if (separator != NULL)
+        name_a = separator + 1;
+    separator = strrchr(name_a, '/');
+    if (separator != NULL)
+        name_a = separator + 1;
+
+    separator = strrchr(name_b, '\\');
+    if (separator != NULL)
+        name_b = separator + 1;
+    separator = strrchr(name_b, '/');
+    if (separator != NULL)
+        name_b = separator + 1;
+
+    len_a = strlen(name_a);
+    len_b = strlen(name_b);
+
+    while (len_a >= 4 && _stricmp(name_a + len_a - 4, ".exe") == 0)
         len_a -= 4;
-
-    if (len_b >= 4 && _stricmp(b + len_b - 4, ".exe") == 0)
+    while (len_b >= 4 && _stricmp(name_b + len_b - 4, ".exe") == 0)
         len_b -= 4;
 
-    return len_a == len_b && _strnicmp(a, b, len_a) == 0;
+    return len_a == len_b && _strnicmp(name_a, name_b, len_a) == 0;
 }
 
 static int get_process_image_path(DWORD pid, char *image_path, DWORD path_size)
@@ -42,6 +67,29 @@ static int get_process_image_path(DWORD pid, char *image_path, DWORD path_size)
     int success = QueryFullProcessImageNameA(process, 0, image_path, &path_size);
     CloseHandle(process);
     return success;
+}
+
+static int process_id_exists(DWORD pid)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return 0;
+
+    PROCESSENTRY32 entry = {0};
+    entry.dwSize = sizeof(entry);
+
+    int found = 0;
+    if (Process32First(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == pid) {
+                found = 1;
+                break;
+            }
+        } while (Process32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return found;
 }
 
 static int list_processes(const char *filter_name, DWORD filter_pid)
@@ -229,6 +277,45 @@ static int list_modules_by_name(const char *name)
         fprintf(stderr, "[WARN] Enumeration ended unexpectedly: %lu\n", error);
     return 0;
 }
+
+static int find_process_pid_by_name(const char *name, DWORD *pid_out)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        fprintf(stderr,
+                "[ERROR] Snapshot failed: %lu\n",
+                GetLastError());
+        return 0;
+    }
+
+    PROCESSENTRY32 entry = {0};
+    entry.dwSize = sizeof(entry);
+
+    if (!Process32First(snapshot, &entry)) {
+        DWORD error = GetLastError();
+        CloseHandle(snapshot);
+
+        fprintf(stderr,
+                "[ERROR] Process32First failed: %lu\n",
+                error);
+        return 0;
+    }
+
+    do {
+        if (name_equal(entry.szExeFile, name)) {
+            *pid_out = entry.th32ProcessID;
+            CloseHandle(snapshot);
+            return 1;
+        }
+
+    } while (Process32Next(snapshot, &entry));
+
+    CloseHandle(snapshot);
+    return 0;
+}
+
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -287,6 +374,62 @@ int main(int argc, char *argv[])
             return 1;
         }
         return list_processes(argv[2], 0);
+    }
+
+    if (strcmp(argv[1], "-monitor-pid") == 0) {
+    if (argc != 3) {
+        fprintf(stderr,
+                "[ERROR] Usage: -monitor-pid <PID>\n");
+        return 1;
+    }
+
+    char *end = NULL;
+    unsigned long pid = strtoul(argv[2], &end, 10);
+
+    if (argv[2][0] == '\0' ||
+        end == argv[2] ||
+        *end != '\0' ||
+        pid == 0 ||
+        pid > 0xFFFFFFFFUL) {
+
+        fprintf(stderr,
+                "[ERROR] Invalid PID: %s\n",
+                argv[2]);
+
+        return 1;
+    }
+
+    if (!process_id_exists((DWORD)pid)) {
+        fprintf(stderr, "[ERROR] PID %lu is not a running process.\n", pid);
+        return 1;
+    }
+
+    return monitor_pid((DWORD)pid);
+    }
+
+    if (strcmp(argv[1], "-monitor-name") == 0) {
+    if (argc != 3 || argv[2][0] == '\0') {
+        fprintf(stderr,
+                "[ERROR] Usage: -monitor-name <PROCESS_NAME>\n");
+        return 1;
+    }
+
+    DWORD pid = 0;
+
+    if (!find_process_pid_by_name(argv[2], &pid)) {
+        fprintf(stderr,
+                "[ERROR] Process not found: %s\n",
+                argv[2]);
+        return 1;
+    }
+
+    printf(
+        "[+] Found %s -> PID %lu\n",
+        argv[2],
+        (unsigned long)pid
+    );
+
+    return monitor_pid(pid);
     }
 
     fprintf(stderr, "[ERROR] Command not found: %s\n", argv[1]);

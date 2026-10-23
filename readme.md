@@ -1,36 +1,40 @@
 # DLL Watch
 
-DLL Watch is a Windows command-line tool written in C for inspecting processes and investigating DLL load behavior. The current version provides a process snapshot and can enumerate the modules currently loaded by a process. Real-time DLL load and failed-search monitoring are planned roadmap items.
+DLL Watch is a Windows command-line tool written in C for inspecting processes, listing loaded modules, and monitoring successful DLL load events in real time through ETW.
 
-## Current Features
+## Features
 
 - List running processes with PID, parent PID, executable name, and image path.
 - Filter the process list by PID or executable name.
 - Enumerate currently loaded module paths by PID or process name.
+- Monitor DLL load events for a process by PID or process name.
+- Display the event PID, process image path when available, DLL base address, image size, and DLL path.
 - Match process names with or without the `.exe` suffix, without regard to letter case.
+- Check that a PID exists before starting `-monitor-pid` monitoring.
 
-> Module enumeration is a snapshot of modules currently loaded. It does not monitor new load or unload events in real time.
+Module enumeration is a snapshot of modules currently loaded. ETW monitoring reports new DLL load events after the monitoring session starts; it does not provide a retroactive list of modules already loaded.
+
+Failed DLL searches, unload events, and DLL search-order hijacking analysis are not currently implemented.
 
 ## Requirements
 
-- Windows
-- A C compiler with Windows SDK headers and libraries
+- Windows 8 or later for a custom named system logger session that receives SystemTraceProvider events.
+- A C compiler with Windows SDK or MinGW-w64 headers and libraries.
+- Sufficient privileges to start a system logger session. Run from an elevated terminal if ETW reports an access error.
 
 ## Build
 
-With Microsoft Visual C (Developer Command Prompt):
+From the `src` directory, with Microsoft Visual C (Developer Command Prompt):
 
 ```bat
-cl /W4 main.c /link Psapi.lib
+cl /W4 main.c etw_monitor.c /link Psapi.lib Advapi32.lib Tdh.lib
 ```
 
 With MinGW-w64:
 
 ```bat
-gcc -Wall -Wextra -o dll-watch.exe main.c -lpsapi
+gcc -Wall -Wextra -Wpedantic -o dll-watch.exe main.c etw_monitor.c -lpsapi -ladvapi32 -ltdh
 ```
-
-The source includes the Psapi header and requests `Psapi.lib` when built with MSVC. MinGW builds must link `psapi` explicitly.
 
 ## Usage
 
@@ -41,7 +45,11 @@ dll-watch.exe -pid <PID>
 dll-watch.exe -name <PROCESS_NAME>
 dll-watch.exe -modules <PID>
 dll-watch.exe -modules-name <PROCESS_NAME>
+dll-watch.exe -monitor-pid <PID>
+dll-watch.exe -monitor-name <PROCESS_NAME>
 ```
+
+Process names may be given with or without `.exe`. `-monitor-name` selects the first matching running process. Monitoring continues until the program is stopped, for example with `Ctrl+C`.
 
 ### Examples
 
@@ -57,64 +65,36 @@ Show a process by PID:
 dll-watch.exe -pid 4520
 ```
 
-Find processes by name (`.exe` is optional):
+Find processes by name:
 
 ```bat
-dll-watch.exe -name Spotify
+dll-watch.exe -name <PROCESS_NAME>
 ```
 
 List modules currently loaded by a process:
 
 ```bat
 dll-watch.exe -modules 4520
+dll-watch.exe -modules-name <PROCESS_NAME>
 ```
 
-List modules for every running process with the given name:
+Monitor new DLL loads by PID or process name:
 
 ```bat
-dll-watch.exe -modules-name Spotify.exe
+dll-watch.exe -monitor-pid 4520
+dll-watch.exe -monitor-name <PROCESS_NAME>
 ```
+
+A DLL load event is printed with the process PID and image path (or `<unavailable>`), DLL base address, image size, and DLL path. If a previous `DllWatchKernelSession` session remains, the tool attempts to stop that named session and start it again. It does not stop the NT Kernel Logger session.
 
 ## Roadmap
 
-### 01. Process inventory and basic CLI
-
-- [x] List running processes using `CreateToolhelp32Snapshot`, `Process32First`, and `Process32Next`.
-- [x] Show each process's PID and name in a readable table. The current table also includes PPID and image path.
-- [x] Filter by a specific PID or process name.
-- [x] Provide a readable table format.
-
-### 02. Monitor successful DLL loads in real time
-
-- [ ] Listen for ETW Image Load events.
-- [ ] Display PID, process name, DLL path, and timestamp.
-- [ ] Add the `-loaded` filter.
-
-The goal is to capture new module load events as they happen, rather than relying only on a snapshot of a process's current module inventory.
-
-### 03. Capture failed DLL searches
-
-- [ ] Inspect file I/O telemetry.
-- [ ] Identify `NAME NOT FOUND` results.
-- [ ] Exclude file access events unrelated to DLL search behavior.
-- [ ] Add the `-notfound` filter.
-
-This stage requires careful event classification because a failed file access does not necessarily represent a failed DLL search.
-
-### 04. Filtering and event correlation
-
-- [ ] Support combined filters such as `-pid 4520`, `-process test.exe`, `-loaded`, `-notfound`, `-unloaded`, and `-dll version.dll`.
-- [ ] Correlate relevant failed searches with successful loads using timing and path context.
-- [ ] Present events in a unified output format.
-
-### 05. Reliability and detection-oriented features
-
+- [ ] Capture failed DLL searches by inspecting file I/O telemetry and identifying relevant `NAME NOT FOUND` results.
+- [ ] Add event filters for loaded, unloaded, and not-found DLLs.
+- [ ] Correlate failed searches with successful loads using timing and path context.
 - [ ] Handle processes that start or exit while monitoring.
-- [ ] Handle permission limitations and process architecture mismatches clearly.
-- [ ] Filter noisy system DLL searches.
-- [ ] Add optional CSV output.
-- [ ] Add analysis features for DLL search-order hijacking research.
+- [ ] Add optional CSV output and analysis features for DLL search-order hijacking research.
 
 ## Notes
 
-Windows may deny access to protected or elevated processes. Module enumeration can also be affected when the target and utility have different 32-bit or 64-bit architectures. Real-time event monitoring and the roadmap filters are not implemented yet.
+Windows may deny access to protected or elevated processes. The process image path may therefore be unavailable even when the ETW event is received. A custom system logger session can only be multiplexed with SystemTraceProvider on Windows 8 and later; Windows 7 and Windows Server 2008 R2 support that provider only through the NT Kernel Logger session.
