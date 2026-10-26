@@ -14,7 +14,7 @@ DLL Watch is a Windows command-line tool written in C for inspecting processes, 
 
 Module enumeration is a snapshot of modules currently loaded. ETW monitoring reports new DLL load events after the monitoring session starts; it does not provide a retroactive list of modules already loaded.
 
-Failed DLL searches, unload events, and DLL search-order hijacking analysis are not currently implemented.
+The lifecycle monitor pairs DLL load and unload events by PID, image base, and path. It derives displayed event times from ETW timestamps and computes lifetime from their 100-nanosecond FILETIME intervals, marks unloads whose load event was not observed, and labels a process as tearing down when its PID is no longer present. It provides lifecycle context and does not make a suspiciousness verdict.
 
 ## Requirements
 
@@ -47,9 +47,14 @@ dll-watch.exe -modules <PID>
 dll-watch.exe -modules-name <PROCESS_NAME>
 dll-watch.exe -monitor-pid <PID>
 dll-watch.exe -monitor-name <PROCESS_NAME>
+dll-watch.exe -monitor-unload <PROCESS_NAME|PID>
+dll-watch.exe -monitor-lifecycle <PROCESS_NAME|PID>
+dll-watch.exe -monitor-name-not-found <PROCESS_NAME|PID>
 ```
 
-Process names may be given with or without `.exe`. `-monitor-name` selects the first matching running process. Monitoring continues until the program is stopped, for example with `Ctrl+C`.
+Process names may be given with or without `.exe`. Name-based monitoring tracks every currently running process with that name and any matching process that starts while monitoring. PID-based monitoring targets only the specified process. `-monitor-name` reports DLL loads. `-monitor-name-not-found` reports missing `.dll` search candidates that end with `STATUS_OBJECT_NAME_NOT_FOUND`. Monitoring continues until the program is stopped, for example with `Ctrl+C`.
+
+Use `-monitor-unload` to show raw DLL unload events, `-monitor-lifecycle` to correlate loads and unloads, or `-monitor-name-not-found` to show only `.dll` file open attempts that end with `STATUS_OBJECT_NAME_NOT_FOUND`. These commands accept a process name or PID.
 
 ### Examples
 
@@ -83,15 +88,26 @@ Monitor new DLL loads by PID or process name:
 ```bat
 dll-watch.exe -monitor-pid 4520
 dll-watch.exe -monitor-name <PROCESS_NAME>
+dll-watch.exe -monitor-unload <PROCESS_NAME>
+dll-watch.exe -monitor-unload 4520
+dll-watch.exe -monitor-lifecycle <PROCESS_NAME>
+dll-watch.exe -monitor-lifecycle 4520
+dll-watch.exe -monitor-name-not-found <PROCESS_NAME>
+dll-watch.exe -monitor-name-not-found 4520
 ```
 
-A DLL load event is printed with the process PID and image path (or `<unavailable>`), DLL base address, image size, and DLL path. If a previous `DllWatchKernelSession` session remains, the tool attempts to stop that named session and start it again. It does not stop the NT Kernel Logger session.
+A DLL load event is printed with the process PID and image path (or `<unavailable>`), DLL base address, image size, and DLL path. Lifecycle records show load and unload times, fractional-millisecond lifetime, process state, and whether the unload was normal or part of process teardown. Unmatched unloads are reported when the load happened before monitoring began. `NAME NOT FOUND` events include the target PID and attempted path. If a previous `DllWatchKernelSession` session remains, the tool attempts to stop that named session and start it again. It does not stop the NT Kernel Logger session.
 
 ## Roadmap
 
-- [ ] Capture failed DLL searches by inspecting file I/O telemetry and identifying relevant `NAME NOT FOUND` results.
-- [ ] Add event filters for loaded, unloaded, and not-found DLLs.
-- [ ] Correlate failed searches with successful loads using timing and path context.
+- [x] Capture file open attempts that end with `NAME NOT FOUND`.
+- [x] Add separate monitoring commands for unloaded DLLs and not-found paths.
+- [ ] Classify DLL paths as system, application, or user-writable locations.
+- [ ] Check DLL signatures and expected signer information.
+- [ ] Track repeated load/unload patterns and unusual process-to-DLL relationships.
+- [x] Correlate DLL loads and unloads and report module lifetimes.
+- [ ] Correlate failed lookup chains with subsequent loads using timing and path context.
+- [ ] Correlate loads with later process access and thread-creation activity.
 - [ ] Handle processes that start or exit while monitoring.
 - [ ] Add optional CSV output and analysis features for DLL search-order hijacking research.
 

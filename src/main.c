@@ -18,11 +18,14 @@ static void print_help(void)
     printf("  dll-watch.exe -help\n");
     printf("  dll-watch.exe -processes\n");
     printf("  dll-watch.exe -pid <PID>\n");
+    printf("  dll-watch.exe -name <PROCESS_NAME>\n");
     printf("  dll-watch.exe -modules <PID>\n");
     printf("  dll-watch.exe -modules-name <PROCESS_NAME>\n");
-    printf("  dll-watch.exe -name <PROCESS_NAME>\n");
     printf("  dll-watch.exe -monitor-pid <PID>\n");
     printf("  dll-watch.exe -monitor-name <PROCESS_NAME>\n");
+    printf("  dll-watch.exe -monitor-unload <PROCESS_NAME|PID>\n");
+    printf("  dll-watch.exe -monitor-lifecycle <PROCESS_NAME|PID>\n");
+    printf("  dll-watch.exe -monitor-name-not-found <PROCESS_NAME|PID>\n");
 }
 
 static int name_equal(const char *a, const char *b)
@@ -278,44 +281,6 @@ static int list_modules_by_name(const char *name)
     return 0;
 }
 
-static int find_process_pid_by_name(const char *name, DWORD *pid_out)
-{
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        fprintf(stderr,
-                "[ERROR] Snapshot failed: %lu\n",
-                GetLastError());
-        return 0;
-    }
-
-    PROCESSENTRY32 entry = {0};
-    entry.dwSize = sizeof(entry);
-
-    if (!Process32First(snapshot, &entry)) {
-        DWORD error = GetLastError();
-        CloseHandle(snapshot);
-
-        fprintf(stderr,
-                "[ERROR] Process32First failed: %lu\n",
-                error);
-        return 0;
-    }
-
-    do {
-        if (name_equal(entry.szExeFile, name)) {
-            *pid_out = entry.th32ProcessID;
-            CloseHandle(snapshot);
-            return 1;
-        }
-
-    } while (Process32Next(snapshot, &entry));
-
-    CloseHandle(snapshot);
-    return 0;
-}
-
-
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -414,22 +379,62 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    DWORD pid = 0;
-
-    if (!find_process_pid_by_name(argv[2], &pid)) {
-        fprintf(stderr,
-                "[ERROR] Process not found: %s\n",
-                argv[2]);
-        return 1;
+    return monitor_name(argv[2]);
     }
 
-    printf(
-        "[+] Found %s -> PID %lu\n",
-        argv[2],
-        (unsigned long)pid
-    );
+    if (strcmp(argv[1], "-monitor-unload") == 0 ||
+        strcmp(argv[1], "-monitor-name-not-found") == 0) {
+        if (argc != 3 || argv[2][0] == '\0') {
+            fprintf(stderr, "[ERROR] Usage: %s <PROCESS_NAME|PID>\n", argv[1]);
+            return 1;
+        }
 
-    return monitor_pid(pid);
+        DLLWATCH_FILTER filter =
+            strcmp(argv[1], "-monitor-unload") == 0
+                ? DLLWATCH_FILTER_UNLOAD
+                : DLLWATCH_FILTER_NOT_FOUND;
+
+        char *end = NULL;
+        unsigned long pid_value = strtoul(argv[2], &end, 10);
+        int is_pid = end != argv[2] && *end == '\0';
+        if (is_pid && (pid_value == 0 || pid_value > 0xFFFFFFFFUL)) {
+            fprintf(stderr, "[ERROR] Invalid PID: %s\n", argv[2]);
+            return 1;
+        }
+
+        if (is_pid) {
+            if (!process_id_exists((DWORD)pid_value)) {
+                fprintf(stderr, "[ERROR] PID %lu is not a running process.\n", pid_value);
+                return 1;
+            }
+            return monitor_pid_filtered((DWORD)pid_value, filter);
+        }
+
+        return monitor_name_filtered(argv[2], filter);
+    }
+
+    if (strcmp(argv[1], "-monitor-lifecycle") == 0) {
+        if (argc != 3 || argv[2][0] == '\0') {
+            fprintf(stderr,
+                    "[ERROR] Usage: -monitor-lifecycle <PROCESS_NAME|PID>\n");
+            return 1;
+        }
+
+        char *end = NULL;
+        unsigned long pid_value = strtoul(argv[2], &end, 10);
+        int is_pid = end != argv[2] && *end == '\0';
+        if (is_pid && (pid_value == 0 || pid_value > 0xFFFFFFFFUL)) {
+            fprintf(stderr, "[ERROR] Invalid PID: %s\n", argv[2]);
+            return 1;
+        }
+        if (is_pid) {
+            if (!process_id_exists((DWORD)pid_value)) {
+                fprintf(stderr, "[ERROR] PID %lu is not a running process.\n", pid_value);
+                return 1;
+            }
+            return monitor_pid_filtered((DWORD)pid_value, DLLWATCH_FILTER_LIFECYCLE);
+        }
+        return monitor_name_filtered(argv[2], DLLWATCH_FILTER_LIFECYCLE);
     }
 
     fprintf(stderr, "[ERROR] Command not found: %s\n", argv[1]);
