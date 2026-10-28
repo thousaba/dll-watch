@@ -12,6 +12,9 @@
 #include <wchar.h>
 #include <wctype.h>
 #include "etw_monitor.h"
+#include "dll_path.h"
+#include "dll_lifecycle.h"
+#include "dll_resolution.h"
 #define DLLWATCH_LOGGER_NAME "DllWatchKernelSession"
 
 static const GUID DLLWATCH_SESSION_GUID =
@@ -22,7 +25,6 @@ static const GUID DLLWATCH_SESSION_GUID =
     {0xa7, 0x12, 0x42, 0x55, 0x91, 0x19, 0x73, 0x01}
 };
 
-/* Classic kernel event class GUIDs; opcodes overlap across event classes. */
 static const GUID PROCESS_EVENT_GUID =
 {
     0x3d6fa8d0, 0xfe05, 0x11d0,
@@ -52,16 +54,7 @@ static SRWLOCK g_target_pid_lock = SRWLOCK_INIT;
 static volatile LONG g_process_watcher_active = 0;
 
 #define MAX_PENDING_FILE_OPS 1024
-#define MAX_LIFECYCLE_RECORDS 4096
 #define STATUS_OBJECT_NAME_NOT_FOUND_VALUE 0xC0000034UL
-
-typedef struct _DLL_LIFECYCLE_RECORD {
-    DWORD pid;
-    ULONGLONG image_base;
-    ULONGLONG load_timestamp;
-    WCHAR *path;
-    SYSTEMTIME loaded_at;
-} DLL_LIFECYCLE_RECORD;
 
 typedef struct _PENDING_FILE_OP {
     ULONGLONG irp;
@@ -71,7 +64,6 @@ typedef struct _PENDING_FILE_OP {
 
 static PENDING_FILE_OP g_pending_file_ops[MAX_PENDING_FILE_OPS];
 static ULONG g_pending_file_cursor = 0;
-static DLL_LIFECYCLE_RECORD g_lifecycle_records[MAX_LIFECYCLE_RECORDS];
 
 static int get_property(
     PEVENT_RECORD event,
@@ -123,93 +115,6 @@ static int get_u64_property(
 
     free(data);
     return 1;
-}
-
-static void print_wide_utf8_raw(const WCHAR *value)
-{
-    if (value == NULL)
-        return;
-
-    int bytes_needed = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        value,
-        -1,
-        NULL,
-        0,
-        NULL,
-        NULL
-    );
-
-    if (bytes_needed <= 0)
-        return;
-
-    char *utf8 = malloc((size_t)bytes_needed);
-    if (utf8 == NULL)
-        return;
-
-    if (WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value,
-            -1,
-            utf8,
-            bytes_needed,
-            NULL,
-            NULL) > 0)
-        fputs(utf8, stdout);
-
-    free(utf8);
-}
-
-static void print_wide_utf8(const WCHAR *value)
-{
-    static WCHAR drive_targets[26][MAX_PATH];
-    static int drive_targets_initialized = 0;
-
-    if (value == NULL)
-        return;
-
-    if (!drive_targets_initialized) {
-        DWORD logical_drives = GetLogicalDrives();
-        for (WCHAR letter = L'A'; letter <= L'Z'; letter++) {
-            DWORD bit = 1UL << (letter - L'A');
-            if ((logical_drives & bit) == 0)
-                continue;
-
-            WCHAR drive_name[] = {letter, L':', L'\0'};
-            QueryDosDeviceW(drive_name,
-                            drive_targets[letter - L'A'],
-                            MAX_PATH);
-        }
-        drive_targets_initialized = 1;
-    }
-
-    if (wcsncmp(value, L"\\Device\\", 8) == 0) {
-        for (WCHAR letter = L'A'; letter <= L'Z'; letter++) {
-            const WCHAR *device_target = drive_targets[letter - L'A'];
-            size_t prefix_length = wcslen(device_target);
-            if (prefix_length == 0 ||
-                _wcsnicmp(value, device_target, prefix_length) != 0 ||
-                (value[prefix_length] != L'\\' &&
-                 value[prefix_length] != L'\0'))
-                continue;
-
-            size_t suffix_length = wcslen(value + prefix_length);
-            WCHAR *dos_path = malloc((suffix_length + 3) * sizeof(WCHAR));
-            if (dos_path != NULL) {
-                dos_path[0] = letter;
-                dos_path[1] = L':';
-                memcpy(dos_path + 2, value + prefix_length,
-                       (suffix_length + 1) * sizeof(WCHAR));
-                print_wide_utf8_raw(dos_path);
-                free(dos_path);
-                return;
-            }
-            break;
-        }
-    }
-    print_wide_utf8_raw(value);
 }
 
 static void save_pending_file_op(ULONGLONG irp, DWORD pid, WCHAR *path)
@@ -325,169 +230,9 @@ static int is_target_pid(DWORD pid)
     return found;
 }
 
-static void print_time(const SYSTEMTIME *time)
-{
-    if (time->wYear == 0) {
-        printf("<unavailable>");
-        return;
-    }
-    printf("%04u-%02u-%02u %02u:%02u:%02u.%03u",
-           time->wYear, time->wMonth, time->wDay,
-           time->wHour, time->wMinute, time->wSecond,
-           time->wMilliseconds);
-}
-
-static SYSTEMTIME event_timestamp_to_local_time(ULONGLONG timestamp)
-{
-    SYSTEMTIME local_time = {0};
-    FILETIME filetime;
-    filetime.dwLowDateTime = (DWORD)(timestamp & 0xFFFFFFFFULL);
-    filetime.dwHighDateTime = (DWORD)(timestamp >> 32);
-    SYSTEMTIME utc_time;
-    if (FileTimeToSystemTime(&filetime, &utc_time))
-        SystemTimeToTzSpecificLocalTime(NULL, &utc_time, &local_time);
-    return local_time;
-}
-
-static int is_process_alive(DWORD pid)
-{
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
-        return -1;
-
-    PROCESSENTRY32 entry = {0};
-    entry.dwSize = sizeof(entry);
-    int found = 0;
-    if (Process32First(snapshot, &entry)) {
-        do {
-            if (entry.th32ProcessID == pid) {
-                found = 1;
-                break;
-            }
-        } while (Process32Next(snapshot, &entry));
-    } else if (GetLastError() != ERROR_NO_MORE_FILES) {
-        CloseHandle(snapshot);
-        return -1;
-    }
-    CloseHandle(snapshot);
-    return found;
-}
-
 static int event_provider_is(PEVENT_RECORD event, const GUID *provider_guid)
 {
     return IsEqualGUID(&event->EventHeader.ProviderId, provider_guid);
-}
-
-static WCHAR *copy_wide_string(const WCHAR *value)
-{
-    size_t length = wcslen(value) + 1;
-    WCHAR *copy = malloc(length * sizeof(WCHAR));
-    if (copy != NULL)
-        memcpy(copy, value, length * sizeof(WCHAR));
-    return copy;
-}
-
-static void handle_lifecycle_event(
-    DWORD pid,
-    ULONGLONG image_base,
-    const WCHAR *path,
-    UCHAR opcode,
-    ULONGLONG event_timestamp
-)
-{
-    if (opcode == 10) {
-        DWORD slot = MAX_LIFECYCLE_RECORDS;
-        DWORD oldest_slot = 0;
-        ULONGLONG oldest_timestamp = ULLONG_MAX;
-
-        for (DWORD i = 0; i < MAX_LIFECYCLE_RECORDS; i++) {
-            DLL_LIFECYCLE_RECORD *record = &g_lifecycle_records[i];
-            if (record->path != NULL && record->pid == pid &&
-                record->image_base == image_base &&
-                _wcsicmp(record->path, path) == 0) {
-                slot = i;
-                break;
-            }
-            if (record->path == NULL && slot == MAX_LIFECYCLE_RECORDS)
-                slot = i;
-            if (record->path != NULL && record->load_timestamp < oldest_timestamp) {
-                oldest_timestamp = record->load_timestamp;
-                oldest_slot = i;
-            }
-        }
-        if (slot == MAX_LIFECYCLE_RECORDS)
-            slot = oldest_slot;
-
-        WCHAR *path_copy = copy_wide_string(path);
-        if (path_copy == NULL)
-            return;
-        free(g_lifecycle_records[slot].path);
-        g_lifecycle_records[slot].pid = pid;
-        g_lifecycle_records[slot].image_base = image_base;
-        g_lifecycle_records[slot].load_timestamp = event_timestamp;
-        g_lifecycle_records[slot].path = path_copy;
-        g_lifecycle_records[slot].loaded_at =
-            event_timestamp_to_local_time(event_timestamp);
-        return;
-    }
-
-    DWORD match = MAX_LIFECYCLE_RECORDS;
-    for (DWORD i = 0; i < MAX_LIFECYCLE_RECORDS; i++) {
-        DLL_LIFECYCLE_RECORD *record = &g_lifecycle_records[i];
-        if (record->path != NULL && record->pid == pid &&
-            record->image_base == image_base &&
-            _wcsicmp(record->path, path) == 0) {
-            match = i;
-            break;
-        }
-    }
-
-    SYSTEMTIME unloaded_at = event_timestamp_to_local_time(event_timestamp);
-    printf("\n[DLL LIFECYCLE]\nPID: %lu\n",
-           (unsigned long)pid);
-    char process_path[MAX_PATH];
-    if (get_process_image_path(pid, process_path, sizeof(process_path)))
-        printf("Process: %s\n", process_path);
-    else
-        printf("Process: <unavailable>\n");
-    printf("Base: 0x%llX\nDLL: ", (unsigned long long)image_base);
-    print_wide_utf8(path);
-    printf("\n");
-
-    if (match == MAX_LIFECYCLE_RECORDS) {
-        printf("Loaded: <before monitoring or unmatched>\n"
-               "Unloaded: ");
-        print_time(&unloaded_at);
-        printf("\nLifetime: unavailable\nReason: unmatched unload\n");
-        return;
-    }
-
-    DLL_LIFECYCLE_RECORD record = g_lifecycle_records[match];
-    g_lifecycle_records[match].path = NULL;
-    ULONGLONG elapsed_ticks = event_timestamp >= record.load_timestamp
-        ? event_timestamp - record.load_timestamp : 0;
-    /* ProcessTrace normalizes timestamps to FILETIME unless RAW_TIMESTAMP is set. */
-    int lifetime_valid = event_timestamp >= record.load_timestamp;
-    double lifetime_ms = lifetime_valid
-        ? (double)elapsed_ticks / 10000.0
-        : 0;
-
-    printf("Loaded: ");
-    print_time(&record.loaded_at);
-    printf("\nUnloaded: ");
-    print_time(&unloaded_at);
-    int process_alive = is_process_alive(pid);
-    if (lifetime_valid)
-        printf("\nLifetime: %.3f ms\n", lifetime_ms);
-    else
-        printf("\nLifetime: unavailable\n");
-    if (process_alive > 0)
-        printf("Process state: alive\nReason: normal unload\n");
-    else if (process_alive == 0)
-        printf("Process state: teardown\nReason: process teardown\n");
-    else
-        printf("Process state: unavailable\nReason: unavailable\n");
-    free(record.path);
 }
 
 static void add_running_processes_by_name(void)
@@ -557,7 +302,8 @@ static void WINAPI event_callback(PEVENT_RECORD event)
     }
 
     if (opcode == 64) {
-        if (g_event_filter != DLLWATCH_FILTER_NOT_FOUND)
+        if (g_event_filter != DLLWATCH_FILTER_NOT_FOUND &&
+            g_event_filter != DLLWATCH_FILTER_RESOLUTION)
             return;
 
         ULONGLONG irp = 0;
@@ -579,7 +325,8 @@ static void WINAPI event_callback(PEVENT_RECORD event)
     }
 
     if (opcode == 76) {
-        if (g_event_filter != DLLWATCH_FILTER_NOT_FOUND)
+        if (g_event_filter != DLLWATCH_FILTER_NOT_FOUND &&
+            g_event_filter != DLLWATCH_FILTER_RESOLUTION)
             return;
 
         ULONGLONG irp = 0;
@@ -592,21 +339,29 @@ static void WINAPI event_callback(PEVENT_RECORD event)
                 printf("\n[NAME NOT FOUND]\n");
                 printf("PID:  %lu\n", (unsigned long)event->EventHeader.ProcessId);
                 printf("Path: ");
-                print_wide_utf8(path != NULL ? path : L"<path unavailable>");
+                dll_path_print(path != NULL ? path : L"<path unavailable>");
                 printf("\n");
+                dll_path_print_classification(event->EventHeader.ProcessId, path);
+                if (g_event_filter == DLLWATCH_FILTER_RESOLUTION)
+                    dll_resolution_record_lookup(
+                        event->EventHeader.ProcessId,
+                        path,
+                        (ULONGLONG)event->EventHeader.TimeStamp.QuadPart
+                    );
             }
             free(path);
         }
         return;
     }
 
-    /* Process stop events share opcode 2 with image unload events. */
     if (!event_provider_is(event, &IMAGE_EVENT_GUID))
         return;
 
     if (opcode != 10 && opcode != 2)
         return;
     if (g_event_filter == DLLWATCH_FILTER_NOT_FOUND)
+        return;
+    if (g_event_filter == DLLWATCH_FILTER_RESOLUTION && opcode != 10)
         return;
     if (g_event_filter == DLLWATCH_FILTER_UNLOAD && opcode != 2)
         return;
@@ -666,17 +421,6 @@ static void WINAPI event_callback(PEVENT_RECORD event)
     else if (image_size_size == sizeof(ULONG))
         image_size = *(ULONG *)size_data;
 
-    if (g_event_filter == DLLWATCH_FILTER_LIFECYCLE) {
-        handle_lifecycle_event(
-            pid,
-            image_base,
-            (WCHAR *)name_data,
-            opcode,
-            (ULONGLONG)event->EventHeader.TimeStamp.QuadPart
-        );
-        goto cleanup;
-    }
-
     char process_path[MAX_PATH];
     DWORD process_path_size = MAX_PATH;
 
@@ -686,6 +430,18 @@ static void WINAPI event_callback(PEVENT_RECORD event)
             process_path,
             process_path_size
         );
+
+    if (g_event_filter == DLLWATCH_FILTER_LIFECYCLE) {
+        dll_lifecycle_handle_event(
+            pid,
+            have_process ? process_path : NULL,
+            image_base,
+            (WCHAR *)name_data,
+            opcode,
+            (ULONGLONG)event->EventHeader.TimeStamp.QuadPart
+        );
+        goto cleanup;
+    }
 
     printf("\n[%s]\n", opcode == 10 ? "DLL LOAD" : "DLL UNLOAD");
 
@@ -710,8 +466,16 @@ static void WINAPI event_callback(PEVENT_RECORD event)
     );
 
     printf("DLL:     ");
-    print_wide_utf8((WCHAR *)name_data);
+    dll_path_print((WCHAR *)name_data);
     printf("\n");
+    dll_path_print_classification(pid, (WCHAR *)name_data);
+    if (g_event_filter == DLLWATCH_FILTER_RESOLUTION && opcode == 10)
+        dll_resolution_correlate_load(
+            pid,
+            have_process ? process_path : NULL,
+            (WCHAR *)name_data,
+            (ULONGLONG)event->EventHeader.TimeStamp.QuadPart
+        );
 
 cleanup:
     free(pid_data);

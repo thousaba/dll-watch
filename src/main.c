@@ -26,6 +26,7 @@ static void print_help(void)
     printf("  dll-watch.exe -monitor-unload <PROCESS_NAME|PID>\n");
     printf("  dll-watch.exe -monitor-lifecycle <PROCESS_NAME|PID>\n");
     printf("  dll-watch.exe -monitor-name-not-found <PROCESS_NAME|PID>\n");
+    printf("  dll-watch.exe -monitor-resolution <PROCESS_NAME|PID>\n");
 }
 
 static int name_equal(const char *a, const char *b)
@@ -383,7 +384,8 @@ int main(int argc, char *argv[])
     }
 
     if (strcmp(argv[1], "-monitor-unload") == 0 ||
-        strcmp(argv[1], "-monitor-name-not-found") == 0) {
+        strcmp(argv[1], "-monitor-name-not-found") == 0 ||
+        strcmp(argv[1], "-monitor-resolution") == 0) {
         if (argc != 3 || argv[2][0] == '\0') {
             fprintf(stderr, "[ERROR] Usage: %s <PROCESS_NAME|PID>\n", argv[1]);
             return 1;
@@ -392,7 +394,9 @@ int main(int argc, char *argv[])
         DLLWATCH_FILTER filter =
             strcmp(argv[1], "-monitor-unload") == 0
                 ? DLLWATCH_FILTER_UNLOAD
-                : DLLWATCH_FILTER_NOT_FOUND;
+                : strcmp(argv[1], "-monitor-name-not-found") == 0
+                    ? DLLWATCH_FILTER_NOT_FOUND
+                    : DLLWATCH_FILTER_RESOLUTION;
 
         char *end = NULL;
         unsigned long pid_value = strtoul(argv[2], &end, 10);
