@@ -12,6 +12,12 @@ DLL Watch is a Windows command-line tool written in C for inspecting processes, 
 - Classify DLL paths by location and report a separate writable-context hint.
 - Match process names with or without the `.exe` suffix, without regard to letter case.
 - Check that a PID exists before starting `-monitor-pid` monitoring.
+- Verify DLL digital signatures using embedded Authenticode signatures
+  and Windows catalog signatures.
+- Display signature verification status (valid, unsigned, or failed),
+  signature type (embedded, catalog, or none), and signer identity.
+- Extract signer information from both embedded signatures and
+  catalog signatures.
 
 Module enumeration is a snapshot of modules currently loaded. ETW monitoring reports new DLL load events after the monitoring session starts; it does not provide a retroactive list of modules already loaded.
 
@@ -30,13 +36,13 @@ DLL path classification reports a semantic location (`system32`, `syswow64`, `wi
 From the `src` directory, with Microsoft Visual C (Developer Command Prompt):
 
 ```bat
-cl /W4 main.c etw_monitor.c dll_path.c dll_resolution.c dll_lifecycle.c /link Psapi.lib Advapi32.lib Tdh.lib
+cl /W4 /Fe:dll-watch.exe main.c etw_monitor.c dll_path.c dll_resolution.c dll_lifecycle.c dll_signature.c /link Psapi.lib Advapi32.lib Tdh.lib Wintrust.lib Crypt32.lib
 ```
 
 With MinGW-w64:
 
 ```bat
-gcc -Wall -Wextra -Wpedantic -o dll-watch.exe main.c etw_monitor.c dll_path.c dll_resolution.c dll_lifecycle.c -lpsapi -ladvapi32 -ltdh
+C:\mingw64\bin\gcc.exe -Wall -Wextra -Wpedantic -o dll-watch.exe main.c etw_monitor.c dll_path.c dll_resolution.c dll_lifecycle.c dll_signature.c -lpsapi -ladvapi32 -ltdh -lwintrust -lcrypt32
 ```
 
 ## Usage
@@ -104,17 +110,58 @@ dll-watch.exe -monitor-resolution 4520
 
 A DLL load event is printed with the process PID and image path (or `<unavailable>`), DLL base address, image size, and DLL path. Lifecycle records show load and unload times, fractional-millisecond lifetime, process state, and whether the unload was normal or part of process teardown. Unmatched unloads are reported when the load happened before monitoring began. `NAME NOT FOUND` events include the target PID and attempted path. If a previous `DllWatchKernelSession` session remains, the tool attempts to stop that named session and start it again. It does not stop the NT Kernel Logger session.
 
+## Signature Verification
+
+DLL Watch verifies digital signatures for successfully loaded
+images using Windows trust and certificate APIs.
+
+The tool first checks for an embedded Authenticode signature.
+If no embedded signature is found, it attempts Windows catalog
+signature verification.
+
+For each inspected image, the tool reports:
+
+- Signature: valid, unsigned, or verification failed.
+- Signature type: embedded, catalog, or none.
+- Signer: certificate subject name when available.
+
+Example:
+
+DLL: C:\Windows\System32\MsSpellCheckingFacility.dll
+Signature: valid
+Signature type: catalog
+Signer: Microsoft Windows
+
+An unsigned DLL may be legitimate, and a valid signature does
+not guarantee that a file is benign.
+
+Signer information represents certificate identity, not an
+application-specific trusted publisher allowlist.
+
+Signature verification currently runs synchronously during ETW
+event processing. Caching and asynchronous enrichment are planned
+to reduce overhead.
+
 ## Roadmap
 
+### Completed
 - [x] Capture file open attempts that end with `NAME NOT FOUND`.
 - [x] Add separate monitoring commands for unloaded DLLs and not-found paths.
 - [x] Classify DLL paths by semantic location and writable context.
-- [ ] Check DLL signatures and expected signer information.
-- [ ] Track repeated load/unload patterns and unusual process-to-DLL relationships.
+- [x] Verify embedded Authenticode signatures.
+- [x] Verify Windows catalog signatures.
+- [x] Extract signer identity from embedded and catalog signatures.
+- [x] Report signature verification status and signature type.
 - [x] Correlate DLL loads and unloads and report module lifetimes.
 - [x] Correlate failed lookups with later loads by PID, DLL basename, and a five-second time window.
+- [x] Discover newly started processes during name-based monitoring.
+
+### Planned
+- [ ] Add signature verification caching and asynchronous processing.
+- [ ] Improve process exit handling and PID reuse protection.
+- [ ] Implement expected-signer validation and trusted publisher policies.
+- [ ] Track repeated load/unload patterns and unusual process-to-DLL relationships.
 - [ ] Correlate loads with later process access and thread-creation activity.
-- [ ] Handle processes that start or exit while monitoring.
 - [ ] Add optional CSV output and analysis features for DLL search-order hijacking research.
 
 ## Notes

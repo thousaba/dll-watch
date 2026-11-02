@@ -1,5 +1,4 @@
 #define INITGUID
-
 #include <windows.h>
 #include <tlhelp32.h>
 #include <evntrace.h>
@@ -15,6 +14,8 @@
 #include "dll_path.h"
 #include "dll_lifecycle.h"
 #include "dll_resolution.h"
+#include "dll_signature.h"
+
 #define DLLWATCH_LOGGER_NAME "DllWatchKernelSession"
 
 static const GUID DLLWATCH_SESSION_GUID =
@@ -37,7 +38,6 @@ static const GUID IMAGE_EVENT_GUID =
     {0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18}
 };
 
-
 #ifdef _MSC_VER
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -52,8 +52,8 @@ static DWORD g_target_pids[1024];
 static DWORD g_target_pid_count = 0;
 static SRWLOCK g_target_pid_lock = SRWLOCK_INIT;
 static volatile LONG g_process_watcher_active = 0;
-
 #define MAX_PENDING_FILE_OPS 1024
+
 #define STATUS_OBJECT_NAME_NOT_FOUND_VALUE 0xC0000034UL
 
 typedef struct _PENDING_FILE_OP {
@@ -64,7 +64,6 @@ typedef struct _PENDING_FILE_OP {
 
 static PENDING_FILE_OP g_pending_file_ops[MAX_PENDING_FILE_OPS];
 static ULONG g_pending_file_cursor = 0;
-
 static int get_property(
     PEVENT_RECORD event,
     const wchar_t *property_name,
@@ -79,14 +78,11 @@ static int get_process_image_path(
 )
 {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-
     if (process == NULL)
         return 0;
-
     DWORD length = path_size;
     BOOL success = QueryFullProcessImageNameA(process, 0, image_path, &length);
     CloseHandle(process);
-
     return success != FALSE;
 }
 
@@ -98,10 +94,8 @@ static int get_u64_property(
 {
     BYTE *data = NULL;
     ULONG size = 0;
-
     if (!get_property(event, property_name, &data, &size))
         return 0;
-
     if (size == sizeof(ULONG64))
         memcpy(value, data, sizeof(ULONG64));
     else if (size == sizeof(ULONG)) {
@@ -112,7 +106,6 @@ static int get_u64_property(
         free(data);
         return 0;
     }
-
     free(data);
     return 1;
 }
@@ -120,7 +113,6 @@ static int get_u64_property(
 static void save_pending_file_op(ULONGLONG irp, DWORD pid, WCHAR *path)
 {
     ULONG slot = g_pending_file_cursor++ % MAX_PENDING_FILE_OPS;
-
     for (ULONG i = 0; i < MAX_PENDING_FILE_OPS; i++) {
         ULONG candidate = (slot + i) % MAX_PENDING_FILE_OPS;
         if (g_pending_file_ops[candidate].irp == irp &&
@@ -133,7 +125,6 @@ static void save_pending_file_op(ULONGLONG irp, DWORD pid, WCHAR *path)
             break;
         }
     }
-
     free(g_pending_file_ops[slot].path);
     g_pending_file_ops[slot].irp = irp;
     g_pending_file_ops[slot].pid = pid;
@@ -160,7 +151,6 @@ static int is_dll_path(const WCHAR *path)
     size_t length = wcslen(path);
     if (length < 4 || path[length - 4] != L'.')
         return 0;
-
     return towlower(path[length - 3]) == L'd' &&
            towlower(path[length - 2]) == L'l' &&
            towlower(path[length - 1]) == L'l';
@@ -172,26 +162,22 @@ static int process_name_matches(const char *image_path, const char *target_name)
     const char *target_base = strrchr(target_name, '\\');
     size_t image_len;
     size_t target_len;
-
     if (base != NULL)
         image_path = base + 1;
     base = strrchr(image_path, '/');
     if (base != NULL)
         image_path = base + 1;
-
     if (target_base != NULL)
         target_name = target_base + 1;
     target_base = strrchr(target_name, '/');
     if (target_base != NULL)
         target_name = target_base + 1;
-
     image_len = strlen(image_path);
     target_len = strlen(target_name);
     if (image_len >= 4 && _stricmp(image_path + image_len - 4, ".exe") == 0)
         image_len -= 4;
     if (target_len >= 4 && _stricmp(target_name + target_len - 4, ".exe") == 0)
         target_len -= 4;
-
     return image_len == target_len &&
            _strnicmp(image_path, target_name, image_len) == 0;
 }
@@ -206,12 +192,10 @@ static int add_target_pid(DWORD pid)
             return 0;
         }
     }
-
     if (g_target_pid_count >= sizeof(g_target_pids) / sizeof(g_target_pids[0])) {
         ReleaseSRWLockExclusive(&g_target_pid_lock);
         return 0;
     }
-
     g_target_pids[g_target_pid_count++] = pid;
     added = 1;
     ReleaseSRWLockExclusive(&g_target_pid_lock);
@@ -243,7 +227,6 @@ static void add_running_processes_by_name(void)
                 GetLastError());
         return;
     }
-
     PROCESSENTRY32 entry = {0};
     entry.dwSize = sizeof(entry);
     if (Process32First(snapshot, &entry)) {
@@ -256,31 +239,26 @@ static void add_running_processes_by_name(void)
             }
         } while (Process32Next(snapshot, &entry));
     }
-
     CloseHandle(snapshot);
 }
 
 static DWORD WINAPI process_watcher_thread(LPVOID context)
 {
     UNREFERENCED_PARAMETER(context);
-
     while (InterlockedCompareExchange(&g_process_watcher_active, 1, 1) == 1) {
         add_running_processes_by_name();
         Sleep(100);
     }
-
     return 0;
 }
 
 static void WINAPI event_callback(PEVENT_RECORD event)
 {
     UCHAR opcode = event->EventHeader.EventDescriptor.Opcode;
-
     if (g_target_name[0] != '\0' &&
         event_provider_is(event, &PROCESS_EVENT_GUID) && opcode == 1) {
         char image_path[MAX_PATH];
         DWORD pid = event->EventHeader.ProcessId;
-
         if (pid != 0 &&
             get_process_image_path(pid, image_path, sizeof(image_path)) &&
             process_name_matches(image_path, g_target_name) &&
@@ -291,7 +269,6 @@ static void WINAPI event_callback(PEVENT_RECORD event)
         }
         return;
     }
-
     LONG target_pid = InterlockedCompareExchange(&g_target_pid, 0, 0);
     if (g_target_name[0] != '\0') {
         if (!is_target_pid(event->EventHeader.ProcessId))
@@ -300,16 +277,13 @@ static void WINAPI event_callback(PEVENT_RECORD event)
                event->EventHeader.ProcessId != (ULONG)target_pid) {
         return;
     }
-
     if (opcode == 64) {
         if (g_event_filter != DLLWATCH_FILTER_NOT_FOUND &&
             g_event_filter != DLLWATCH_FILTER_RESOLUTION)
             return;
-
         ULONGLONG irp = 0;
         BYTE *path_data = NULL;
         ULONG path_size = 0;
-
         if (get_u64_property(event, L"IrpPtr", &irp) &&
             get_property(event, L"OpenPath", &path_data, &path_size) &&
             path_size >= sizeof(WCHAR)) {
@@ -323,12 +297,10 @@ static void WINAPI event_callback(PEVENT_RECORD event)
         free(path_data);
         return;
     }
-
     if (opcode == 76) {
         if (g_event_filter != DLLWATCH_FILTER_NOT_FOUND &&
             g_event_filter != DLLWATCH_FILTER_RESOLUTION)
             return;
-
         ULONGLONG irp = 0;
         ULONGLONG nt_status = 0;
         if (get_u64_property(event, L"IrpPtr", &irp) &&
@@ -353,10 +325,8 @@ static void WINAPI event_callback(PEVENT_RECORD event)
         }
         return;
     }
-
     if (!event_provider_is(event, &IMAGE_EVENT_GUID))
         return;
-
     if (opcode != 10 && opcode != 2)
         return;
     if (g_event_filter == DLLWATCH_FILTER_NOT_FOUND)
@@ -367,70 +337,57 @@ static void WINAPI event_callback(PEVENT_RECORD event)
         return;
     if (g_event_filter == DLLWATCH_FILTER_ALL && opcode != 10)
         return;
-
     BYTE *pid_data = NULL;
     BYTE *base_data = NULL;
     BYTE *size_data = NULL;
     BYTE *name_data = NULL;
-
     ULONG pid_size = 0;
     ULONG base_size = 0;
     ULONG image_size_size = 0;
     ULONG name_size = 0;
-
     if (!get_property(
             event,
             L"ProcessId",
             &pid_data,
             &pid_size))
         goto cleanup;
-
     if (!get_property(
             event,
             L"ImageBase",
             &base_data,
             &base_size))
         goto cleanup;
-
     if (!get_property(
             event,
             L"ImageSize",
             &size_data,
             &image_size_size))
         goto cleanup;
-
     if (!get_property(
             event,
             L"FileName",
             &name_data,
             &name_size))
         goto cleanup;
-
     ULONG pid = *(ULONG *)pid_data;
-
     ULONGLONG image_base = 0;
     ULONGLONG image_size = 0;
-
     if (base_size == sizeof(ULONG64))
         image_base = *(ULONG64 *)base_data;
     else if (base_size == sizeof(ULONG))
         image_base = *(ULONG *)base_data;
-
     if (image_size_size == sizeof(ULONG64))
         image_size = *(ULONG64 *)size_data;
     else if (image_size_size == sizeof(ULONG))
         image_size = *(ULONG *)size_data;
-
     char process_path[MAX_PATH];
     DWORD process_path_size = MAX_PATH;
-
     int have_process =
         get_process_image_path(
             pid,
             process_path,
             process_path_size
         );
-
     if (g_event_filter == DLLWATCH_FILTER_LIFECYCLE) {
         dll_lifecycle_handle_event(
             pid,
@@ -442,33 +399,82 @@ static void WINAPI event_callback(PEVENT_RECORD event)
         );
         goto cleanup;
     }
-
     printf("\n[%s]\n", opcode == 10 ? "DLL LOAD" : "DLL UNLOAD");
-
     printf(
         "PID:     %lu\n",
         (unsigned long)pid
     );
-
     if (have_process)
         printf("Process: %s\n", process_path);
     else
         printf("Process: <unavailable>\n");
-
     printf(
         "Base:    0x%llX\n",
         (unsigned long long)image_base
     );
-
     printf(
         "Size:    %llu bytes\n",
         (unsigned long long)image_size
     );
-
     printf("DLL:     ");
     dll_path_print((WCHAR *)name_data);
     printf("\n");
     dll_path_print_classification(pid, (WCHAR *)name_data);
+    if (opcode == 10) {
+        WCHAR normalized_path[32768] = {0};
+        if (dll_path_to_dos(
+                (WCHAR *)name_data,
+                normalized_path,
+                sizeof(normalized_path) / sizeof(normalized_path[0])
+            ) &&
+            normalized_path[1] == L':' &&
+            normalized_path[2] == L'\\') {
+            DLL_SIGNATURE_INFO signature;
+            dll_signature_inspect(normalized_path, &signature);
+
+            switch (signature.status) {
+                case DLL_SIGNATURE_VALID:
+                    printf("Signature: valid\n");
+                    break;
+                case DLL_SIGNATURE_UNSIGNED:
+                    printf("Signature: unsigned\n");
+                    break;
+                default:
+                    printf("Signature: verification failed (0x%08lX)\n",
+                           (unsigned long)signature.error_code);
+                    break;
+            }
+
+            const char *signature_type = "unknown";
+            switch (signature.type) {
+                case DLL_SIGNATURE_TYPE_EMBEDDED:
+                    signature_type = "embedded";
+                    break;
+                case DLL_SIGNATURE_TYPE_CATALOG:
+                    signature_type = "catalog";
+                    break;
+                case DLL_SIGNATURE_TYPE_NONE:
+                    signature_type = "none";
+                    break;
+                default:
+                    break;
+            }
+            printf("Signature type: %s\n", signature_type);
+
+            printf("Signer: ");
+            if (signature.signer[0] != L'\0')
+                dll_path_print(signature.signer);
+            else if (signature.status == DLL_SIGNATURE_UNSIGNED)
+                printf("none");
+            else
+                printf("unavailable");
+            printf("\n");
+        } else {
+            printf("Signature: path unavailable for verification\n");
+            printf("Signature type: unknown\n");
+            printf("Signer: unavailable\n");
+        }
+    }
     if (g_event_filter == DLLWATCH_FILTER_RESOLUTION && opcode == 10)
         dll_resolution_correlate_load(
             pid,
@@ -476,13 +482,13 @@ static void WINAPI event_callback(PEVENT_RECORD event)
             (WCHAR *)name_data,
             (ULONGLONG)event->EventHeader.TimeStamp.QuadPart
         );
-
 cleanup:
     free(pid_data);
     free(base_data);
     free(size_data);
     free(name_data);
 }
+
 static int get_property(
     PEVENT_RECORD event,
     const wchar_t *property_name,
@@ -491,12 +497,9 @@ static int get_property(
 )
 {
     PROPERTY_DATA_DESCRIPTOR descriptor = {0};
-
     descriptor.PropertyName = (ULONGLONG)property_name;
     descriptor.ArrayIndex = ULONG_MAX;
-
     ULONG size = 0;
-
     ULONG status = TdhGetPropertySize(
         event,
         0,
@@ -505,7 +508,6 @@ static int get_property(
         &descriptor,
         &size
     );
-
     if (status != ERROR_SUCCESS) {
         fprintf(stderr,
                 "[ERROR] TdhGetPropertySize failed for %ls: %lu\n",
@@ -513,14 +515,11 @@ static int get_property(
                 status);
         return 0;
     }
-
     BYTE *data = malloc(size);
-
     if (data == NULL) {
         fprintf(stderr, "[ERROR] Out of memory.\n");
         return 0;
     }
-
     status = TdhGetProperty(
         event,
         0,
@@ -530,163 +529,127 @@ static int get_property(
         size,
         data
     );
-
     if (status != ERROR_SUCCESS) {
         fprintf(stderr,
                 "[ERROR] TdhGetProperty failed for %ls: %lu\n",
                 property_name,
                 status);
-
         free(data);
         return 0;
     }
-
     *buffer = data;
     *buffer_size = size;
-
     return 1;
 }
 
 static int monitor_pid_with_filter(DWORD target_pid, DLLWATCH_FILTER filter)
 {
     ULONG status;
-
     SetConsoleOutputCP(CP_UTF8);
     g_event_filter = filter;
     if (g_target_name[0] != '\0')
         InterlockedExchange(&g_target_pid, 0);
     else
         InterlockedExchange(&g_target_pid, (LONG)target_pid);
-
     ULONG properties_size =
         sizeof(EVENT_TRACE_PROPERTIES) +
         sizeof(DLLWATCH_LOGGER_NAME);
-
     EVENT_TRACE_PROPERTIES *properties =
         calloc(1, properties_size);
-
     if (properties == NULL) {
         fprintf(stderr, "[ERROR] Memory allocation failed.\n");
         return 1;
     }
-
     properties->Wnode.BufferSize = properties_size;
     properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
     properties->Wnode.ClientContext = 1;
     properties->Wnode.Guid = DLLWATCH_SESSION_GUID;
-
     properties->LogFileMode =
         EVENT_TRACE_REAL_TIME_MODE |
         EVENT_TRACE_SYSTEM_LOGGER_MODE;
-
     properties->EnableFlags =
         EVENT_TRACE_FLAG_IMAGE_LOAD |
         EVENT_TRACE_FLAG_PROCESS |
         EVENT_TRACE_FLAG_FILE_IO |
         EVENT_TRACE_FLAG_FILE_IO_INIT;
-
     properties->LoggerNameOffset =
         sizeof(EVENT_TRACE_PROPERTIES);
-
     status = StartTrace(
         &session_handle,
         DLLWATCH_LOGGER_NAME,
         properties
     );
-
     if (status == ERROR_ALREADY_EXISTS) {
         printf("[!] Previous dll-watch ETW session found. Cleaning it up...\n");
-
         ULONG stop_status = ControlTrace(
             0,
             DLLWATCH_LOGGER_NAME,
             properties,
             EVENT_TRACE_CONTROL_STOP
         );
-
         if (stop_status != ERROR_SUCCESS &&
             stop_status != ERROR_WMI_INSTANCE_NOT_FOUND) {
             fprintf(stderr,
                     "[ERROR] Could not stop stale session: %lu\n",
                     stop_status);
-
             free(properties);
             return 1;
         }
-
         memset(properties, 0, properties_size);
-
         properties->Wnode.BufferSize = properties_size;
         properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         properties->Wnode.ClientContext = 1;
         properties->Wnode.Guid = DLLWATCH_SESSION_GUID;
-
         properties->LogFileMode =
             EVENT_TRACE_REAL_TIME_MODE |
             EVENT_TRACE_SYSTEM_LOGGER_MODE;
-
         properties->EnableFlags =
             EVENT_TRACE_FLAG_IMAGE_LOAD |
             EVENT_TRACE_FLAG_PROCESS |
             EVENT_TRACE_FLAG_FILE_IO |
             EVENT_TRACE_FLAG_FILE_IO_INIT;
-
         properties->LoggerNameOffset =
             sizeof(EVENT_TRACE_PROPERTIES);
-
         status = StartTrace(
             &session_handle,
             DLLWATCH_LOGGER_NAME,
             properties
         );
     }
-
     if (status != ERROR_SUCCESS) {
         fprintf(stderr,
                 "[ERROR] StartTrace failed: %lu\n",
                 status);
-
         free(properties);
         return 1;
     }
-
     if (g_target_name[0] != '\0')
         add_running_processes_by_name();
-
     if (g_target_name[0] != '\0' && g_target_pid_count == 0)
         printf("[+] Waiting for process %s to start...\n\n", g_target_name);
     else if (g_target_name[0] == '\0')
         printf("[+] Monitoring DLL activity for PID %lu...\n\n",
                (unsigned long)target_pid);
-
     EVENT_TRACE_LOGFILE logfile = {0};
-
     logfile.LoggerName = DLLWATCH_LOGGER_NAME;
-
     logfile.ProcessTraceMode =
         PROCESS_TRACE_MODE_REAL_TIME |
         PROCESS_TRACE_MODE_EVENT_RECORD;
-
     logfile.EventRecordCallback = event_callback;
-
     trace_handle = OpenTrace(&logfile);
-
     if (trace_handle == INVALID_PROCESSTRACE_HANDLE) {
         fprintf(stderr,
                 "[ERROR] OpenTrace failed: %lu\n",
                 GetLastError());
-
         ControlTrace(
             session_handle,
             DLLWATCH_LOGGER_NAME,
             properties,
             EVENT_TRACE_CONTROL_STOP
         );
-
         free(properties);
         return 1;
     }
-
     HANDLE process_watch_thread = NULL;
     if (g_target_name[0] != '\0') {
         InterlockedExchange(&g_process_watcher_active, 1);
@@ -703,37 +666,30 @@ static int monitor_pid_with_filter(DWORD target_pid, DLLWATCH_FILTER filter)
             fprintf(stderr, "[WARN] Process watcher thread could not be started.\n");
         }
     }
-
     status = ProcessTrace(
         &trace_handle,
         1,
         NULL,
         NULL
     );
-
     InterlockedExchange(&g_process_watcher_active, 0);
     if (process_watch_thread != NULL) {
         WaitForSingleObject(process_watch_thread, INFINITE);
         CloseHandle(process_watch_thread);
     }
-
     if (status != ERROR_SUCCESS) {
         fprintf(stderr,
                 "[ERROR] ProcessTrace failed: %lu\n",
                 status);
     }
-
     CloseTrace(trace_handle);
-
     ControlTrace(
         session_handle,
         DLLWATCH_LOGGER_NAME,
         properties,
         EVENT_TRACE_CONTROL_STOP
     );
-
     free(properties);
-
     return 0;
 }
 

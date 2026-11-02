@@ -235,7 +235,68 @@ DLL_PATH_CLASSIFICATION classify_dll_path(DWORD pid, const WCHAR *dll_path)
     if (_wcsicmp(result.location, L"application-directory") == 0) {
         result.writable = have_user_profile && path_is_under(candidate, user_profile)
             ? L"yes" : L"unknown";
+        return result;
+    }
+    return result;     
     }
 
-    return result;
+
+    int dll_path_to_dos(
+       const WCHAR *source,
+       WCHAR *destination,
+       size_t capacity
+    )
+    {
+    if (source == NULL || destination == NULL || capacity == 0)
+        return 0;
+
+    if (wcsncmp(source, L"\\Device\\", 8) == 0) {
+        DWORD drives = GetLogicalDrives();
+
+        for (WCHAR letter = L'A'; letter <= L'Z'; letter++) {
+            if (!(drives & (1UL << (letter - L'A'))))
+                continue;
+
+            WCHAR drive_name[] = {letter, L':', L'\0'};
+            WCHAR device_target[MAX_PATH];
+
+            if (!QueryDosDeviceW(drive_name, device_target, MAX_PATH))
+                continue;
+
+            size_t prefix_length = wcslen(device_target);
+
+            if (_wcsnicmp(source, device_target, prefix_length) != 0)
+                continue;
+
+            if (source[prefix_length] != L'\\' &&
+                source[prefix_length] != L'\0')
+                continue;
+
+            const WCHAR *suffix = source + prefix_length;
+            size_t suffix_length = wcslen(suffix);
+
+            if (suffix_length + 3 > capacity)
+                return 0;
+
+            destination[0] = letter;
+            destination[1] = L':';
+
+            wmemcpy(destination + 2, suffix, suffix_length + 1);
+
+            return 1;
+        }
+
+        return 0;
+    }
+
+    size_t length = wcslen(source);
+
+    if (length + 1 > capacity)
+        return 0;
+
+    wmemcpy(destination, source, length + 1);
+    return 1;
 }
+
+
+
