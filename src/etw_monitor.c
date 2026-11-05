@@ -14,7 +14,8 @@
 #include "dll_path.h"
 #include "dll_lifecycle.h"
 #include "dll_resolution.h"
-#include "dll_signature.h"
+#include "dll_signature_cache.h"
+#include "dll_async.h"
 
 #define DLLWATCH_LOGGER_NAME "DllWatchKernelSession"
 
@@ -52,6 +53,46 @@ static DWORD g_target_pids[1024];
 static DWORD g_target_pid_count = 0;
 static SRWLOCK g_target_pid_lock = SRWLOCK_INIT;
 static volatile LONG g_process_watcher_active = 0;
+static volatile LONG g_shutdown_requested = 0;
+
+static BOOL WINAPI dllwatch_ctrl_handler(DWORD ctrl_type)
+{
+    if (ctrl_type != CTRL_C_EVENT &&
+        ctrl_type != CTRL_BREAK_EVENT) {
+        return FALSE;
+    }
+
+    /* Only the first Ctrl+C should stop the ETW session. */
+    if (InterlockedCompareExchange(
+            &g_shutdown_requested, 1, 0) == 0) {
+
+        struct {
+            EVENT_TRACE_PROPERTIES props;
+            char logger_name[sizeof(DLLWATCH_LOGGER_NAME)];
+        } stop_info = {0};
+
+        stop_info.props.Wnode.BufferSize = sizeof(stop_info);
+        stop_info.props.Wnode.Guid = DLLWATCH_SESSION_GUID;
+        stop_info.props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        stop_info.props.LoggerNameOffset =
+            sizeof(EVENT_TRACE_PROPERTIES);
+
+        ULONG result = ControlTrace(
+            0,
+            DLLWATCH_LOGGER_NAME,
+            &stop_info.props,
+            EVENT_TRACE_CONTROL_STOP
+        );
+
+        if (result != ERROR_SUCCESS &&
+            result != ERROR_WMI_INSTANCE_NOT_FOUND) {
+            InterlockedExchange(&g_shutdown_requested, 0);
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
 #define MAX_PENDING_FILE_OPS 1024
 
 #define STATUS_OBJECT_NAME_NOT_FOUND_VALUE 0xC0000034UL
@@ -399,94 +440,91 @@ static void WINAPI event_callback(PEVENT_RECORD event)
         );
         goto cleanup;
     }
-    printf("\n[%s]\n", opcode == 10 ? "DLL LOAD" : "DLL UNLOAD");
-    printf(
-        "PID:     %lu\n",
-        (unsigned long)pid
-    );
-    if (have_process)
-        printf("Process: %s\n", process_path);
-    else
-        printf("Process: <unavailable>\n");
-    printf(
-        "Base:    0x%llX\n",
-        (unsigned long long)image_base
-    );
-    printf(
-        "Size:    %llu bytes\n",
-        (unsigned long long)image_size
-    );
-    printf("DLL:     ");
-    dll_path_print((WCHAR *)name_data);
-    printf("\n");
-    dll_path_print_classification(pid, (WCHAR *)name_data);
+      
     if (opcode == 10) {
-        WCHAR normalized_path[32768] = {0};
-        if (dll_path_to_dos(
-                (WCHAR *)name_data,
-                normalized_path,
-                sizeof(normalized_path) / sizeof(normalized_path[0])
-            ) &&
-            normalized_path[1] == L':' &&
-            normalized_path[2] == L'\\') {
-            DLL_SIGNATURE_INFO signature;
-            dll_signature_inspect(normalized_path, &signature);
+    WCHAR normalized_path[32768] = {0};
 
-            switch (signature.status) {
-                case DLL_SIGNATURE_VALID:
-                    printf("Signature: valid\n");
-                    break;
-                case DLL_SIGNATURE_UNSIGNED:
-                    printf("Signature: unsigned\n");
-                    break;
-                default:
-                    printf("Signature: verification failed (0x%08lX)\n",
-                           (unsigned long)signature.error_code);
-                    break;
-            }
+    const WCHAR *source_path = (const WCHAR *)name_data;
+    const WCHAR *job_path = source_path;
 
-            const char *signature_type = "unknown";
-            switch (signature.type) {
-                case DLL_SIGNATURE_TYPE_EMBEDDED:
-                    signature_type = "embedded";
-                    break;
-                case DLL_SIGNATURE_TYPE_CATALOG:
-                    signature_type = "catalog";
-                    break;
-                case DLL_SIGNATURE_TYPE_NONE:
-                    signature_type = "none";
-                    break;
-                default:
-                    break;
-            }
-            printf("Signature type: %s\n", signature_type);
-
-            printf("Signer: ");
-            if (signature.signer[0] != L'\0')
-                dll_path_print(signature.signer);
-            else if (signature.status == DLL_SIGNATURE_UNSIGNED)
-                printf("none");
-            else
-                printf("unavailable");
-            printf("\n");
-        } else {
-            printf("Signature: path unavailable for verification\n");
-            printf("Signature type: unknown\n");
-            printf("Signer: unavailable\n");
-        }
+    if (dll_path_to_dos(
+            source_path,
+            normalized_path,
+            sizeof(normalized_path) / sizeof(normalized_path[0]))) {
+        job_path = normalized_path;
     }
-    if (g_event_filter == DLLWATCH_FILTER_RESOLUTION && opcode == 10)
-        dll_resolution_correlate_load(
+
+    DLL_PATH_CLASSIFICATION classification =
+        classify_dll_path(pid, source_path);
+
+    DLLWATCH_IMAGE_JOB job = {0};
+
+    job.pid = pid;
+    job.image_base = image_base;
+    job.image_size = image_size;
+
+    job.timestamp =
+        (ULONGLONG)event->EventHeader.TimeStamp.QuadPart;
+
+    job.opcode = opcode;
+    job.dll_path = (WCHAR *)job_path;
+    job.have_process = have_process ? TRUE : FALSE;
+
+        if (have_process) {
+          snprintf(
+            job.process_path,
+            sizeof(job.process_path),
+            "%s",
+            process_path
+        );
+        }
+
+        wcsncpy(
+          job.location,
+          classification.location,
+          sizeof(job.location) / sizeof(WCHAR) - 1
+        );
+
+        wcsncpy(
+          job.writable,
+          classification.writable,
+          sizeof(job.writable) / sizeof(WCHAR) - 1
+        );
+
+        if (!dll_async_submit(&job)) {
+        fprintf(
+            stderr,
+            "[WARN] DLL event could not be queued. PID=%lu\n",
+            (unsigned long)pid
+        );
+        }
+
+        } else {
+        printf("\n[DLL UNLOAD]\n");
+        printf("PID: %lu\n", (unsigned long)pid);
+        printf("Process: %s\n",
+           have_process ? process_path : "<unavailable>");
+        printf("Base: 0x%llX\n",
+           (unsigned long long)image_base);
+        printf("DLL: ");
+        dll_path_print((WCHAR *)name_data);
+        printf("\n");
+        dll_path_print_classification(pid, (WCHAR *)name_data);
+        }
+
+        if (g_event_filter == DLLWATCH_FILTER_RESOLUTION && opcode == 10) {
+          dll_resolution_correlate_load(
             pid,
             have_process ? process_path : NULL,
             (WCHAR *)name_data,
             (ULONGLONG)event->EventHeader.TimeStamp.QuadPart
-        );
-cleanup:
-    free(pid_data);
-    free(base_data);
-    free(size_data);
-    free(name_data);
+            );
+        }
+        cleanup:
+        free(pid_data);
+        free(base_data);
+        free(size_data);
+        free(name_data);
 }
 
 static int get_property(
@@ -545,6 +583,9 @@ static int get_property(
 static int monitor_pid_with_filter(DWORD target_pid, DLLWATCH_FILTER filter)
 {
     ULONG status;
+    int use_async =
+    filter == DLLWATCH_FILTER_ALL ||
+    filter == DLLWATCH_FILTER_RESOLUTION;
     SetConsoleOutputCP(CP_UTF8);
     g_event_filter = filter;
     if (g_target_name[0] != '\0')
@@ -638,9 +679,7 @@ static int monitor_pid_with_filter(DWORD target_pid, DLLWATCH_FILTER filter)
     logfile.EventRecordCallback = event_callback;
     trace_handle = OpenTrace(&logfile);
     if (trace_handle == INVALID_PROCESSTRACE_HANDLE) {
-        fprintf(stderr,
-                "[ERROR] OpenTrace failed: %lu\n",
-                GetLastError());
+        fprintf(stderr, "[ERROR] OpenTrace failed: %lu\n", GetLastError());
         ControlTrace(
             session_handle,
             DLLWATCH_LOGGER_NAME,
@@ -650,6 +689,42 @@ static int monitor_pid_with_filter(DWORD target_pid, DLLWATCH_FILTER filter)
         free(properties);
         return 1;
     }
+
+    if (use_async && !dll_async_init()) {
+        fprintf(stderr, "[ERROR] Async worker initialization failed.\n");
+        CloseTrace(trace_handle);
+        ControlTrace(
+            session_handle,
+            DLLWATCH_LOGGER_NAME,
+            properties,
+            EVENT_TRACE_CONTROL_STOP
+        );
+        free(properties);
+        return 1;
+    }
+
+    InterlockedExchange(&g_shutdown_requested, 0);
+
+    if (!SetConsoleCtrlHandler(dllwatch_ctrl_handler, TRUE)) {
+      fprintf(stderr, "[ERROR] Could not register Ctrl+C handler.\n");
+
+    CloseTrace(trace_handle);
+
+    ControlTrace(
+        session_handle,
+        DLLWATCH_LOGGER_NAME,
+        properties,
+        EVENT_TRACE_CONTROL_STOP
+    );
+
+    if (use_async) {
+        dll_async_shutdown();
+    }
+
+    free(properties);
+    return 1;
+    }
+
     HANDLE process_watch_thread = NULL;
     if (g_target_name[0] != '\0') {
         InterlockedExchange(&g_process_watcher_active, 1);
@@ -677,18 +752,35 @@ static int monitor_pid_with_filter(DWORD target_pid, DLLWATCH_FILTER filter)
         WaitForSingleObject(process_watch_thread, INFINITE);
         CloseHandle(process_watch_thread);
     }
-    if (status != ERROR_SUCCESS) {
-        fprintf(stderr,
-                "[ERROR] ProcessTrace failed: %lu\n",
-                status);
+    LONG shutdown_requested =
+    InterlockedCompareExchange(&g_shutdown_requested, 0, 0);
+
+    if (status != ERROR_SUCCESS &&
+    !(shutdown_requested &&
+      status == ERROR_WMI_INSTANCE_NOT_FOUND)) {
+
+    fprintf(stderr,
+            "[ERROR] ProcessTrace failed: %lu\n",
+            status);
     }
+
     CloseTrace(trace_handle);
+
+    if (!shutdown_requested) {
     ControlTrace(
         session_handle,
         DLLWATCH_LOGGER_NAME,
         properties,
         EVENT_TRACE_CONTROL_STOP
     );
+    }
+
+    if (use_async) {
+    dll_async_shutdown();
+    }
+
+    SetConsoleCtrlHandler(dllwatch_ctrl_handler, FALSE);
+
     free(properties);
     return 0;
 }
